@@ -1,113 +1,83 @@
-import os, json, random, datetime as dt
-from pathlib import Path
+import os
+import json
+import random
+from datetime import datetime, timezone
+
 import tweepy
 
-MAX_PER_DAY = 5
-STATE = Path("state.json")
-QUOTES = Path("quotes.json")
-MAX_TWEET = 280
-POSTING_WINDOW = (9, 21)  # UTC hours [9:00, 21:59]
+# ======= Settings you can tweak =======
+POSTING_WINDOW = (9, 21)          # UTC hours [start, end] allowed to post
+FORCE_POST = os.getenv("FORCE_POST", "0") == "1"   # set to "1" in workflow env to force a test post
+QUOTES_FILE = "quotes.json"
+# ======================================
 
-def now_utc():
-    return dt.datetime.utcnow()
+# --- Twitter auth (OAuth 1.0a user context; required for posting) ---
+API_KEY        = os.environ["X_API_KEY"]
+API_SECRET     = os.environ["X_API_SECRET"]
+ACCESS_TOKEN   = os.environ["X_ACCESS_TOKEN"]
+ACCESS_SECRET  = os.environ["X_ACCESS_SECRET"]
 
-def local_hour_from_offset(offset_minutes=0):
-    return now_utc().hour
+client = tweepy.Client(
+    consumer_key=API_KEY,
+    consumer_secret=API_SECRET,
+    access_token=ACCESS_TOKEN,
+    access_token_secret=ACCESS_SECRET,
+)
 
-def load_quotes():
-    data = json.loads(QUOTES.read_text(encoding="utf-8"))
-    data = [q.strip() for q in data if q and len(q.strip()) <= MAX_TWEET]
-    if not data:
-        raise RuntimeError("quotes.json is empty or all entries >280 chars.")
-    return data
+def utc_hour() -> int:
+    return datetime.now(timezone.utc).hour
 
-def load_state():
-    if STATE.exists():
-        try:
-            return json.loads(STATE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"date": None, "used_indices": [], "count_today": 0}
-
-def save_state(s):
-    STATE.write_text(json.dumps(s), encoding="utf-8")
-
-def rotate_quote(quotes, used):
-    if len(used) >= len(quotes):
-        used.clear()
-    remaining = [i for i in range(len(quotes)) if i not in used]
-    idx = random.choice(remaining)
-    used.add(idx)
-    return idx, quotes[idx]
-
-def within_window():
-    h = local_hour_from_offset()
-    return POSTING_WINDOW[0] <= h <= POSTING_WINDOW[1]
-
-def should_post_this_run(count_today, runs_left_today):
-    needed = MAX_PER_DAY - count_today
-    if needed <= 0 or runs_left_today <= 0:
-        return False
-    p = needed / runs_left_today
-    p = min(0.85, max(0.05, p))
-    return random.random() < p
-
-def runs_left_today():
-    h = local_hour_from_offset()
+def within_window() -> bool:
+    if FORCE_POST:
+        return True
     start, end = POSTING_WINDOW
-    if h < start: return (end - start + 1)
-    if h > end:   return 0
-    return end - h + 1
+    h = utc_hour()
+    return start <= h <= end
 
-def post(text):
-    client = tweepy.Client(
-        bearer_token=os.environ["X_BEARER_TOKEN"],
-        consumer_key=os.environ["X_API_KEY"],
-        consumer_secret=os.environ["X_API_SECRET"],
-        access_token=os.environ["X_ACCESS_TOKEN"],
-        access_token_secret=os.environ["X_ACCESS_SECRET"],
-    )
-    return client.create_tweet(text=text)
+def load_quotes(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-def maybe_humanize(text):
-    tags = ["", " ✨", " 🌟", " — a reminder", " — wise words", " • keep going"]
-    suffix = random.choice(tags) if random.random() < 0.3 else ""
-    out = (text + suffix).strip()
-    return out if len(out) <= MAX_TWEET else text
+    quotes = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                quotes.append(item.strip())
+            elif isinstance(item, dict):
+                text = (item.get("text") or "").strip()
+                author = (item.get("author") or "").strip()
+                if text and author:
+                    quotes.append(f"“{text}” — {author}")
+                elif text:
+                    quotes.append(text)
+    return [q for q in quotes if q]
+
+def pick_quote() -> str:
+    quotes = load_quotes(QUOTES_FILE)
+    if not quotes:
+        raise RuntimeError("No quotes found in quotes.json")
+    return random.choice(quotes)
+
+def post_tweet(text: str):
+    resp = client.create_tweet(text=text)
+    tid = resp.data.get("id") if (resp and resp.data) else None
+    print(f"Tweeted id={tid} text={text}")
 
 def main():
-    today = now_utc().date().isoformat()
-    quotes = load_quotes()
-    state = load_state()
-
-    if state.get("date") != today:
-        state = {"date": today, "used_indices": [], "count_today": 0}
-
     if not within_window():
-        print("Outside posting window; skipping.")
-        save_state(state)
+        print(f"Outside posting window {POSTING_WINDOW}, skipping.")
         return
 
-    left = runs_left_today()
-    if not should_post_this_run(state["count_today"], left):
-        print(f"Skipping this run. Posted so far: {state['count_today']}/{MAX_PER_DAY}.")
-        save_state(state)
-        return
-
-    used_set = set(state["used_indices"])
-    idx, q = rotate_quote(quotes, used_set)
-    q = maybe_humanize(q)
-
+    quote = pick_quote()
     try:
-        resp = post(q)
-        used_set.add(idx)
-        state["used_indices"] = list(used_set)
-        state["count_today"] += 1
-        print(f"Tweeted ({state['count_today']}/{MAX_PER_DAY}): {q}")
-    except Exception as e:
-        print(f"Post failed: {e}")
-    finally:
-        save_state(state)
+        post_tweet(quote)
+    except tweepy.TweepyException as e:
+        # surface useful details in the Actions log
+        status = getattr(e, "response", None)
+        code = getattr(status, "status_code", None)
+        text = getattr(status, "text", None)
+        print(f"Post failed: {code} {e}\n{(text or '')}")
+        raise
 
 if __name__ == "__main__":
     main()
