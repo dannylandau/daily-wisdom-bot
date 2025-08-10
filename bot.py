@@ -2,27 +2,22 @@ import os
 import json
 import random
 from datetime import datetime, timezone
-
 import tweepy
 
-# ======= Settings you can tweak =======
-POSTING_WINDOW = (9, 21)          # UTC hours [start, end] allowed to post
-FORCE_POST = os.getenv("FORCE_POST", "0") == "1"   # set to "1" in workflow env to force a test post
+# ======= Settings =======
+POSTING_WINDOW = (9, 21)                      # UTC hours [start, end]
+FORCE_POST = os.getenv("FORCE_POST", "0") == "1"
 QUOTES_FILE = "quotes.json"
-# ======================================
+# ========================
 
-# --- Twitter auth (OAuth 1.0a user context; required for posting) ---
-API_KEY        = os.environ["X_API_KEY"]
-API_SECRET     = os.environ["X_API_SECRET"]
-ACCESS_TOKEN   = os.environ["X_ACCESS_TOKEN"]
-ACCESS_SECRET  = os.environ["X_ACCESS_SECRET"]
+# --- OAuth 1.0a (v1.1) — most reliable for posting ---
+API_KEY       = os.environ["X_API_KEY"]
+API_SECRET    = os.environ["X_API_SECRET"]
+ACCESS_TOKEN  = os.environ["X_ACCESS_TOKEN"]
+ACCESS_SECRET = os.environ["X_ACCESS_SECRET"]
 
-client = tweepy.Client(
-    consumer_key=API_KEY,
-    consumer_secret=API_SECRET,
-    access_token=ACCESS_TOKEN,
-    access_token_secret=ACCESS_SECRET,
-)
+auth = tweepy.OAuth1UserHandler(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
+api = tweepy.API(auth)
 
 def utc_hour() -> int:
     return datetime.now(timezone.utc).hour
@@ -37,12 +32,12 @@ def within_window() -> bool:
 def load_quotes(path: str):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
     quotes = []
     if isinstance(data, list):
         for item in data:
             if isinstance(item, str):
-                quotes.append(item.strip())
+                q = item.strip()
+                if q: quotes.append(q)
             elif isinstance(item, dict):
                 text = (item.get("text") or "").strip()
                 author = (item.get("author") or "").strip()
@@ -53,17 +48,26 @@ def load_quotes(path: str):
     return [q for q in quotes if q]
 
 def pick_quote() -> str:
-    quotes = load_quotes(QUOTES_FILE)
-    if not quotes:
+    qs = load_quotes(QUOTES_FILE)
+    if not qs:
         raise RuntimeError("No quotes found in quotes.json")
-    return random.choice(quotes)
+    return random.choice(qs)
+
+def verify_auth():
+    """Log which account we're posting as; helpful for debugging."""
+    me = api.verify_credentials()
+    if me:
+        print(f"Authenticated as @{me.screen_name} (id={me.id})")
+    else:
+        print("Warning: could not verify credentials")
 
 def post_tweet(text: str):
-    resp = client.create_tweet(text=text)
-    tid = resp.data.get("id") if (resp and resp.data) else None
-    print(f"Tweeted id={tid} text={text}")
+    status = api.update_status(status=text)
+    print(f"Tweeted id={status.id} text={text}")
 
 def main():
+    verify_auth()
+
     if not within_window():
         print(f"Outside posting window {POSTING_WINDOW}, skipping.")
         return
@@ -71,12 +75,12 @@ def main():
     quote = pick_quote()
     try:
         post_tweet(quote)
-    except tweepy.TweepyException as e:
-        # surface useful details in the Actions log
-        status = getattr(e, "response", None)
-        code = getattr(status, "status_code", None)
-        text = getattr(status, "text", None)
-        print(f"Post failed: {code} {e}\n{(text or '')}")
+    except tweepy.TweepError as e:
+        # Show server response if available
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        body = getattr(resp, "text", None)
+        print(f"Post failed: {code} {e}\n{body or ''}")
         raise
 
 if __name__ == "__main__":
